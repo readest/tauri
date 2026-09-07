@@ -29,15 +29,15 @@ use super::write_and_make_executable;
 /// `quick-sharun.sh` drives the entire deployment and upstream moves fast, so we
 /// pin and checksum it instead of tracking a branch: a release build must not
 /// change behaviour because of a push nobody reviewed. Bump both constants
-/// together after testing the new revision. Same revision as
-/// tauri-apps/tauri#12491.
+/// together after testing the new revision. Includes the deployment-array
+/// quoting fix from pkgforge-dev/Anylinux-AppImages#855.
 ///
 /// The script still downloads a few tools of its own (sharun, appimagetool,
 /// uruntime, onelf); the ones it pins itself are pinned, the rest track their
 /// latest release.
-const QUICK_SHARUN_REV: &str = "facb95e825cb082f634d48385f86b05a5c5cab66";
+const QUICK_SHARUN_REV: &str = "53a05bc37f0d5241fe7ce3c7daee20fd93e26750";
 const QUICK_SHARUN_SHA256: &str =
-  "af0851857ea505a6f600dfc47dcd421f5e719502f880d68cc3741bc23a7700a4";
+  "4a24616f07ff4e9ab908ef17d5ae6e32fe4b697aa21bcd1cd956032648a553d9";
 
 fn anylinux_raw_url(file: &str) -> String {
   format!(
