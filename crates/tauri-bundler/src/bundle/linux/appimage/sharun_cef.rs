@@ -15,10 +15,56 @@ use walkdir::WalkDir;
 use crate::{
   Settings,
   bundle::{linux::freedesktop, settings::Arch},
-  utils::{CommandExt, fs_utils, http_utils::download},
+  utils::{
+    fs_utils,
+    http_utils::{download_and_verify, verify_file_hash, HashAlgorithm},
+    CommandExt,
+  },
 };
 
 use super::write_and_make_executable;
+
+/// Pinned revision of the Anylinux-AppImages tooling.
+///
+/// `quick-sharun.sh` drives the entire deployment and upstream moves fast, so we
+/// pin and checksum it instead of tracking a branch: a release build must not
+/// change behaviour because of a push nobody reviewed. Bump both constants
+/// together after testing the new revision. Same revision as
+/// tauri-apps/tauri#12491.
+///
+/// The script still downloads a few tools of its own (sharun, appimagetool,
+/// uruntime, onelf); the ones it pins itself are pinned, the rest track their
+/// latest release.
+const QUICK_SHARUN_REV: &str = "facb95e825cb082f634d48385f86b05a5c5cab66";
+const QUICK_SHARUN_SHA256: &str =
+  "af0851857ea505a6f600dfc47dcd421f5e719502f880d68cc3741bc23a7700a4";
+
+fn anylinux_raw_url(file: &str) -> String {
+  format!(
+    "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/{QUICK_SHARUN_REV}/useful-tools/{file}"
+  )
+}
+
+/// Resolves the pinned `quick-sharun.sh`, downloading it only when the cached
+/// copy is missing or does not match the pinned checksum. Keeping the revision
+/// in the file name means a build is reproducible and, after the first run,
+/// works offline.
+fn quick_sharun_script(tools_path: &Path) -> crate::Result<PathBuf> {
+  let script = tools_path.join(format!("quick-sharun-{}.sh", &QUICK_SHARUN_REV[..12]));
+
+  if verify_file_hash(&script, QUICK_SHARUN_SHA256, HashAlgorithm::Sha256).is_ok() {
+    return Ok(script);
+  }
+
+  let data = download_and_verify(
+    &anylinux_raw_url("quick-sharun.sh"),
+    QUICK_SHARUN_SHA256,
+    HashAlgorithm::Sha256,
+  )?;
+  write_and_make_executable(&script, data)?;
+
+  Ok(script)
+}
 
 // TODO: Test if bundling xdg-mime makes sense (eg does it even work if it's not on the host system?)
 // TODO: Monitor TLS support / certificates - seems to be working in initial tests
@@ -60,14 +106,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   fs::create_dir_all(&tools_path)?;
 
-  let quick_sharun = tools_path.join("quick-sharun.sh");
-  // TODO: offline build support
-  // github doesn't send a Last-Modified header
-  // if !quick_sharun.exists() {}
-  let data = download(
-    "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/quick-sharun.sh",
-  )?;
-  write_and_make_executable(&quick_sharun, data)?;
+  let quick_sharun = quick_sharun_script(&tools_path)?;
 
   // This should come after the download or users will think it's stuck on the download step.
   log::info!(action = "Bundling"; "{} ({})", appimage_filename, appimage_path.display());
@@ -89,7 +128,21 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   let settings = settings;
 
   fs::create_dir_all(&output_path)?;
-  let app_dir = output_path.join(format!("{product_name}.AppDir"));
+  // quick-sharun rebuilds its argument list through `eval`, which splits a
+  // path on whitespace, and it silently skips wrapping the application binary
+  // when the AppDir path contains any. Name the AppDir without whitespace;
+  // the desktop entry and icon below keep the real product name.
+  let app_dir_name = product_name
+    .chars()
+    .map(|c| if c.is_whitespace() { '_' } else { c })
+    .collect::<String>();
+  let app_dir = output_path.join(format!("{app_dir_name}.AppDir"));
+  if app_dir.to_string_lossy().contains(char::is_whitespace) {
+    return Err(crate::Error::GenericError(format!(
+      "cannot bundle an AppImage under a path that contains whitespace: {}. quick-sharun would split it and skip deploying the application binary. Build from a path without whitespace.",
+      app_dir.display()
+    )));
+  }
   let app_dir_bin = app_dir.join("bin/");
   let app_dir_lib = app_dir.join("lib/");
 
@@ -190,7 +243,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   // We need to give quick-sharun the list of binaries AND libraries to include.
   // To support weird `appimage.files` settings we just walk through the whole AppDir we set up.
   // TODO: In some cases we may have to give quick-sharun the path to some directories as well.
-  let mut elfs = Vec::new();
+  let mut elfs: Vec<String> = Vec::new();
   for entry in WalkDir::new(&app_dir) {
     if let Ok(entry) = entry
       && entry.file_type().is_file()
@@ -205,23 +258,42 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
       elfs.push(source.to_string_lossy().to_string());
     }
   }
-  let elfs = elfs
-    .into_iter()
-    .map(|entry| format!(" \"{entry}\""))
-    .collect::<String>();
+  // `files` is a HashMap, so sort to keep the command reproducible.
+  elfs.sort();
 
-  // TODO: Consider to not rely on quick-sharun when we have more time
-  let mut cmd = Command::new("/bin/sh");
+  // quick-sharun runs each binary it deploys for a few seconds to see which
+  // libraries get dlopened, then kills it with a process-group signal. That
+  // only reaches the process if the shell put it in its own group, which is
+  // what `set -m` is for. dash does not create the group when there is no
+  // controlling terminal, so on Debian and Ubuntu, where /bin/sh is dash,
+  // every terminal-less build - which is every CI run - hangs forever on the
+  // first traced process that does not exit by itself. bash creates the group
+  // either way, so prefer it and fall back to sh where it is missing.
+  let shell = ["/bin/bash", "/usr/bin/bash"]
+    .into_iter()
+    .find(|p| Path::new(p).exists())
+    .unwrap_or("/bin/sh");
+
+  // Passing the script to the shell as an argument rather than building a
+  // `-c` string keeps paths containing spaces intact.
+  let mut cmd = Command::new(shell);
   cmd
+    .arg(&quick_sharun)
+    .args(&elfs)
     .current_dir(&output_path)
     .env("APPDIR", &app_dir)
     // At least on my local machine this was required, worked fine without in CI / using published tauri-apps/cli-cef.
     .env("MAIN_BIN", app_dir_bin.join(settings.main_binary()?.name()))
     .env("OUTPUT_APPIMAGE", "1")
     .env("OUTNAME", &appimage_filename)
-    .env("HOOKSRC", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/hooks")
-    .env("DEPLOY_CHROMIUM", "1")
-    .env("ADD_HOOKS", "fix-namespaces.hook");
+    // Pin the helper library the script compiles into the bundle to the same
+    // revision as the script itself.
+    .env("ANYLINUX_LIB_SOURCE", anylinux_raw_url("lib/anylinux.c"))
+    // Chromium's own host dependencies: NSS, pulse via pipewire, GL, p11-kit.
+    // No ADD_HOOKS: the fix-namespaces hook asks for a root password to
+    // enable unprivileged user namespaces, which CEF only needs when it is
+    // built with the sandbox feature, and it is not on Linux.
+    .env("DEPLOY_CHROMIUM", "1");
 
   // quick-sharun's strace mode runs the app for a few seconds and deploys every
   // library it sees loaded. On a shared runtime that means the CEF distribution
@@ -233,13 +305,22 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     cmd.env("STRACE_MODE", "0");
   }
 
-  cmd
-    .args([
-      "-c",
-      &format!(r#""{}" {elfs}"#, quick_sharun.to_string_lossy()),
-    ])
-    .output_ok()
-    .context("quick-sharun command failed to run.")?;
+  // Streams the tooling's output instead of capturing it: this runs for
+  // minutes, downloads tools and launches the app, and its own error messages
+  // are the only useful diagnostics when something is missing on the system.
+  let status = cmd.piped().context("Failed to run quick-sharun")?;
+  if !status.success() {
+    return Err(crate::Error::GenericError(
+      "quick-sharun failed to build the AppImage, see the output above for details".into(),
+    ));
+  }
+
+  if !appimage_path.exists() {
+    return Err(crate::Error::GenericError(format!(
+      "quick-sharun did not produce {}",
+      appimage_path.display()
+    )));
+  }
 
   Ok(vec![appimage_path])
 }
