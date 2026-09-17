@@ -7,7 +7,7 @@ use std::{
   collections::{HashMap, HashSet},
   fmt,
   fs::create_dir_all,
-  sync::{Arc, Mutex, MutexGuard},
+  sync::{Arc, Mutex, MutexGuard, TryLockError},
 };
 
 use serde::Serialize;
@@ -300,11 +300,26 @@ impl<R: Runtime> WebviewManager<R> {
             on_page_load(&w, &payload);
           }
 
-          app_manager_
-            .plugins
-            .lock()
-            .unwrap()
-            .on_page_load(&w, &payload);
+          // On mobile this runs on the main thread, while a plugin command
+          // (e.g. a path resolution) can hold the plugin store lock and wait
+          // for the main thread to answer `run_mobile_plugin` — blocking here
+          // deadlocks the app. Run the hooks off the main thread when busy.
+          match app_manager_.plugins.try_lock() {
+            Ok(mut plugins) => plugins.on_page_load(&w, &payload),
+            Err(TryLockError::WouldBlock) => {
+              let app_manager = app_manager_.clone();
+              let url = url.clone();
+              std::thread::spawn(move || {
+                let payload = PageLoadPayload { url: &url, event };
+                app_manager
+                  .plugins
+                  .lock()
+                  .unwrap()
+                  .on_page_load(&w, &payload);
+              });
+            }
+            Err(TryLockError::Poisoned(e)) => panic!("{e}"),
+          }
         }
 
         if let Some(handler) = &on_page_load_handler {
@@ -790,5 +805,44 @@ mod tests {
     ));
 
     assert!(!is_local_network_url(&"https://tauri.app".parse().unwrap()));
+  }
+
+  #[test]
+  fn page_load_does_not_wait_for_a_busy_plugin_store() {
+    use crate::{
+      runtime::webview::WebviewAttributes, test::mock_app, webview::PageLoadEvent,
+      WebviewWindowBuilder,
+    };
+    use std::{sync::mpsc::channel, time::Duration};
+
+    let app = mock_app();
+    WebviewWindowBuilder::new(&app, "main", Default::default())
+      .build()
+      .unwrap();
+    let pending = PendingWebview::new(WebviewAttributes::new(Default::default()), "main").unwrap();
+    let mut pending = app
+      .manager()
+      .webview
+      .prepare_pending_webview(pending, "main", "main", &app)
+      .unwrap();
+    let on_page_load = pending.on_page_load_handler.take().unwrap();
+
+    // A plugin command holding the store while it waits for the main thread
+    // (mobile `run_mobile_plugin`), where the page load handler runs.
+    let plugins = app.manager().plugins.lock().unwrap();
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+      on_page_load(
+        "tauri://localhost".parse().unwrap(),
+        PageLoadEvent::Finished,
+      );
+      tx.send(()).unwrap();
+    });
+    let returned = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    drop(plugins);
+    assert!(
+      returned,
+      "the page load handler blocked on the plugin store"
+    );
   }
 }
