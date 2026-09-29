@@ -179,6 +179,14 @@ http-range = "0.1.5"
 
 [features]
 default = ["compression", "common-controls-v6", "dynamic-acl"]
+# readest: no-op stand-ins for the runtime features that moved to the runtime
+# crates. Readest keeps one app manifest for this branch (Linux) and its wry
+# fork (every other platform), and Cargo resolves the lockfile with every
+# feature on, so `wry = ["tauri/wry", "tauri/x11", "tauri/dbus"]` must name
+# features that exist here even though the CEF build never enables them.
+wry = []
+x11 = []
+dbus = []
 unstable = []
 common-controls-v6 = [
   "tray-icon?/common-controls-v6",
