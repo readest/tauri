@@ -2103,6 +2103,16 @@ impl<T: UserEvent> ApplicationHandler for WinitCefApp<T> {
         );
       }
       WinitWindowEvent::Focused(focused) => {
+        #[cfg(any(
+          target_os = "linux",
+          target_os = "dragonfly",
+          target_os = "freebsd",
+          target_os = "netbsd",
+          target_os = "openbsd"
+        ))]
+        if focused && let Some(child) = appwindow.children.first() {
+          child.focus_native();
+        }
         self.emit_window_event(window_id, WindowEvent::Focused(focused));
       }
       WinitWindowEvent::ThemeChanged(theme) => {
