@@ -59,6 +59,27 @@ impl AppWebview {
     })
   }
 
+  /// Give the X input focus to the browser's window.
+  ///
+  /// The window manager focuses the toplevel, and Chromium only takes keys
+  /// while its own window holds the focus or the pointer is inside it, so a
+  /// window activated from the keyboard (alt-tab, a compositor keybinding)
+  /// ignores keys until it is clicked. `BrowserHost::set_focus` does not move
+  /// the X focus for a browser embedded as a child window.
+  pub(crate) fn focus_native(&self) {
+    let xid = self.xid();
+
+    with_cef_display((), |xlib, display| unsafe {
+      // Focusing an unmapped window (a hidden webview) is a BadMatch error.
+      let mut attributes: xlib::XWindowAttributes = std::mem::zeroed();
+      if (xlib.XGetWindowAttributes)(display, xid, &mut attributes) != 0
+        && attributes.map_state == xlib::IsViewable
+      {
+        (xlib.XSetInputFocus)(display, xid, xlib::RevertToParent, xlib::CurrentTime);
+      }
+    });
+  }
+
   pub(crate) fn reparent(&self, parent: &AppWindow) {
     let xid = self.xid();
     let parent_xid = parent.xid();
