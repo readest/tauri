@@ -2820,21 +2820,31 @@ impl<T: UserEvent> CefRuntime<T> {
     // Pinned off whenever no transport was actually configured, including the rejected
     // port above: `RemoteDebuggingServer` consults this before it starts a server for
     // either transport, so it also refuses a switch that reaches Chromium another way.
-    if !remote_debugging_enabled {
-      global_preferences.insert(
-        0,
-        (
-          crate::cef_impl::preferences::REMOTE_DEBUGGING_ALLOWED.to_string(),
-          serde_json::Value::Bool(false),
-        ),
-      );
-    }
+    // Written both ways because it is a local-state preference, persisted in the
+    // profile: pinning only `false` would leave every later launch that does configure
+    // a transport refused by the value an earlier launch stored.
+    global_preferences.insert(
+      0,
+      (
+        crate::cef_impl::preferences::REMOTE_DEBUGGING_ALLOWED.to_string(),
+        serde_json::Value::Bool(remote_debugging_enabled),
+      ),
+    );
 
     let cache_path = cache_path_override.unwrap_or_else(|| {
       let cache_base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
       cache_base.join(&runtime_args.identifier).join("cef")
     });
     let _ = create_dir_all(&cache_path);
+    // Chromium decides whether to start the DevTools server from the stored value while
+    // `cef::initialize` runs, before the global preference queued above is applied.
+    if let Err(error) = crate::cef_impl::preferences::store_local_state_preference(
+      &cache_path,
+      crate::cef_impl::preferences::REMOTE_DEBUGGING_ALLOWED,
+      remote_debugging_enabled,
+    ) {
+      log::warn!("failed to store the remote debugging preference in Local State: {error}");
+    }
 
     // Force X11 usage on Linux.
     //

@@ -260,6 +260,47 @@ pub(crate) fn apply_global_preferences(overrides: &[(String, serde_json::Value)]
   }
 }
 
+/// Writes a boolean local-state preference into the profile's `Local State` file before
+/// `cef::initialize` runs.
+///
+/// [`apply_global_preferences`] can only run once the CEF context exists, but Chromium
+/// reads some of these while `cef::initialize` starts up: it decides whether to start the
+/// DevTools server from `devtools.remote_debugging.allowed` as stored by the previous
+/// launch. Without this, a change would only take effect one launch late. A missing or
+/// unreadable file is left alone: Chromium then starts from its default, and the
+/// in-process write still follows.
+pub(crate) fn store_local_state_preference(
+  cache_path: &std::path::Path,
+  name: &str,
+  value: bool,
+) -> std::io::Result<()> {
+  let path = cache_path.join("Local State");
+  let Ok(contents) = std::fs::read_to_string(&path) else {
+    return Ok(());
+  };
+  let Ok(mut state) = serde_json::from_str::<serde_json::Value>(&contents) else {
+    return Ok(());
+  };
+
+  let mut node = &mut state;
+  for key in name.split('.') {
+    let Some(object) = node.as_object_mut() else {
+      return Ok(());
+    };
+    node = object
+      .entry(key)
+      .or_insert_with(|| serde_json::Value::Object(Default::default()));
+  }
+  if node.as_bool() == Some(value) {
+    return Ok(());
+  }
+  *node = serde_json::Value::Bool(value);
+
+  let temp = path.with_extension("tmp");
+  std::fs::write(&temp, serde_json::to_vec(&state)?)?;
+  std::fs::rename(&temp, &path)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -292,5 +333,54 @@ mod tests {
     ] {
       assert!(PREFERENCES.iter().any(|(name, _)| *name == api));
     }
+  }
+
+  fn local_state_dir(test: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tauri-runtime-cef-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  fn read_local_state(dir: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("Local State")).unwrap()).unwrap()
+  }
+
+  #[test]
+  fn a_stored_value_is_overwritten_before_startup() {
+    let dir = local_state_dir("overwrite");
+    std::fs::write(
+      dir.join("Local State"),
+      r#"{"devtools":{"remote_debugging":{"allowed":false}},"other":1}"#,
+    )
+    .unwrap();
+
+    store_local_state_preference(&dir, REMOTE_DEBUGGING_ALLOWED, true).unwrap();
+
+    let state = read_local_state(&dir);
+    assert_eq!(state["devtools"]["remote_debugging"]["allowed"], true);
+    assert_eq!(state["other"], 1);
+  }
+
+  #[test]
+  fn missing_keys_are_created() {
+    let dir = local_state_dir("create");
+    std::fs::write(dir.join("Local State"), "{}").unwrap();
+
+    store_local_state_preference(&dir, REMOTE_DEBUGGING_ALLOWED, false).unwrap();
+
+    assert_eq!(
+      read_local_state(&dir)["devtools"]["remote_debugging"]["allowed"],
+      false
+    );
+  }
+
+  #[test]
+  fn a_missing_local_state_is_left_to_chromium() {
+    let dir = local_state_dir("missing");
+
+    store_local_state_preference(&dir, REMOTE_DEBUGGING_ALLOWED, true).unwrap();
+
+    assert!(!dir.join("Local State").exists());
   }
 }
