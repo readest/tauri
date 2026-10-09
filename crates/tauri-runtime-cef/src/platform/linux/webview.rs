@@ -106,10 +106,25 @@ impl AppWebview {
   /// window activated from the keyboard (alt-tab, a compositor keybinding)
   /// ignores keys until it is clicked. `BrowserHost::set_focus` does not move
   /// the X focus for a browser embedded as a child window.
-  pub(crate) fn focus_native(&self) {
+  ///
+  /// Only acts while the X focus is still on `parent`, the toplevel whose
+  /// `Focused(true)` led here. winit reports focus changes after the fact, so
+  /// by now the focus may have moved on, e.g. into another window's browser.
+  /// Taking it back on such a stale event makes two windows hand the focus
+  /// to each other forever: every move queues a `FocusIn` for the toplevel
+  /// it lands in, while the other toplevel's queued event moves it back.
+  pub(crate) fn focus_native(&self, parent: &AppWindow) {
     let xid = self.xid();
+    let parent_xid = parent.xid() as xlib::Window;
 
     with_cef_display((), |xlib, display| unsafe {
+      let mut focused: xlib::Window = 0;
+      let mut revert_to = 0;
+      (xlib.XGetInputFocus)(display, &mut focused, &mut revert_to);
+      if focused != parent_xid {
+        return;
+      }
+
       // Focusing an unmapped window (a hidden webview) is a BadMatch error.
       let mut attributes: xlib::XWindowAttributes = std::mem::zeroed();
       if (xlib.XGetWindowAttributes)(display, xid, &mut attributes) != 0

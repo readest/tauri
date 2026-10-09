@@ -2111,7 +2111,7 @@ impl<T: UserEvent> ApplicationHandler for WinitCefApp<T> {
           target_os = "openbsd"
         ))]
         if focused && let Some(child) = appwindow.children.first() {
-          child.focus_native();
+          child.focus_native(appwindow);
         }
         self.emit_window_event(window_id, WindowEvent::Focused(focused));
       }
