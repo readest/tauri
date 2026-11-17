@@ -297,12 +297,10 @@ pub trait WebviewWindowBuilderCefExt {
   /// Keeps the named families of Chrome commands rather than swallowing them.
   ///
   /// A Chrome style browser keeps its whole accelerator table live even hosted as a
-  /// child view with no browser UI, so by default this runtime swallows the commands
-  /// that have no meaning in an app window — new window and tab, the tab strip,
-  /// history, downloads and settings, print, save page, view source, the omnibox
-  /// focus commands. Naming a [`ChromeCommandGroup`] here lets that family run the
-  /// way it would in a browser. Calling this more than once replaces the previous
-  /// list.
+  /// child view with no browser UI, so by default an app window runs none of Chrome's
+  /// commands. Naming a [`ChromeCommandGroup`] here lets that family run the way it
+  /// would in a browser; Chrome's other commands, such as reload and find in page,
+  /// stay off. Calling this more than once replaces the previous list.
   ///
   /// DevTools and zoom accelerators are not covered here: they follow
   /// `WebviewAttributes::devtools` and `WebviewAttributes::zoom_hotkeys_enabled`.
@@ -443,12 +441,10 @@ pub trait WebviewBuilderCefExt {
   /// Keeps the named families of Chrome commands rather than swallowing them.
   ///
   /// A Chrome style browser keeps its whole accelerator table live even hosted as a
-  /// child view with no browser UI, so by default this runtime swallows the commands
-  /// that have no meaning in an app window — new window and tab, the tab strip,
-  /// history, downloads and settings, print, save page, view source, the omnibox
-  /// focus commands. Naming a [`ChromeCommandGroup`] here lets that family run the
-  /// way it would in a browser. Calling this more than once replaces the previous
-  /// list.
+  /// child view with no browser UI, so by default an app window runs none of Chrome's
+  /// commands. Naming a [`ChromeCommandGroup`] here lets that family run the way it
+  /// would in a browser; Chrome's other commands, such as reload and find in page,
+  /// stay off. Calling this more than once replaces the previous list.
   ///
   /// DevTools and zoom accelerators are not covered here: they follow
   /// `WebviewAttributes::devtools` and `WebviewAttributes::zoom_hotkeys_enabled`.

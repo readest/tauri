@@ -235,6 +235,11 @@ pub(crate) type DevToolsProtocolHandler = dyn Fn(DevToolsProtocol) + Send + Sync
 /// [`allow_chrome_commands`](crate::WebviewWindowBuilderCefExt::allow_chrome_commands)
 /// lets that family run the way it would in a browser.
 ///
+/// An application window runs no other Chrome command either: reload, find in page,
+/// caret browsing, fullscreen and whatever later Chromium releases add all do nothing
+/// there, so a key the page leaves alone does nothing. A CEF-owned popup is a real
+/// Chrome window and loses only the families below.
+///
 /// DevTools and zoom are not here: they follow `WebviewAttributes::devtools` and
 /// `WebviewAttributes::zoom_hotkeys_enabled`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1239,13 +1244,13 @@ pub enum RuntimeStyle {
 /// # Chrome accelerators an app window does not get
 ///
 /// A Chrome style browser keeps its whole accelerator table live even hosted as a
-/// child view with no browser UI, so this runtime swallows the commands that have
-/// no meaning in an app window (new window and tab, the tab strip, history and
-/// downloads and settings, print, save page, view source, the omnibox focus
-/// commands). Any family of them can be kept with
-/// [`allow_chrome_commands`](crate::WebviewWindowBuilderCefExt::allow_chrome_commands);
-/// see [`ChromeCommandGroup`] for what each family covers. Two of the exclusions
-/// take away keystrokes users expect:
+/// child view with no browser UI, so in an app window this runtime runs none of
+/// Chrome's commands: the page gets every key, and a key it leaves alone does
+/// nothing. Ctrl+Shift+W and Alt+F4 are the exception: they ask the app to close
+/// the window, as its close button does. The families in [`ChromeCommandGroup`]
+/// can be kept with
+/// [`allow_chrome_commands`](crate::WebviewWindowBuilderCefExt::allow_chrome_commands).
+/// Two of the exclusions take away keystrokes users expect:
 ///
 /// - **Zoom.** `WebviewAttributes::zoom_hotkeys_enabled` is honored, and it
 ///   **defaults to `false`**, so Ctrl+Plus, Ctrl+Minus and Ctrl+0 do not zoom
