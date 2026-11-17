@@ -142,6 +142,16 @@ const ZOOM_COMMANDS: &[&CStr] = &[
   cef::resources::IDC_ZOOM_NORMAL,
 ];
 
+/// Closing the window: Ctrl+Shift+W and Alt+F4.
+///
+/// Chrome would close the browser itself, outside the app's window lifecycle: the
+/// window's close handlers never run, and the window stays on screen with no page
+/// in it. In an app window this asks the app to close the window instead, as the
+/// window's close button does, so the app's close handlers run and can keep it
+/// open. Alt+F4 then still closes the window wherever the window manager passes it
+/// on.
+const CLOSE_WINDOW_COMMANDS: &[&CStr] = &[cef::resources::IDC_CLOSE_WINDOW];
+
 /// The IDC names of one [`ChromeCommandGroup`].
 fn group_commands(group: ChromeCommandGroup) -> &'static [&'static CStr] {
   match group {
@@ -163,6 +173,7 @@ struct BlockedCommands {
   groups: Vec<(ChromeCommandGroup, Vec<c_int>)>,
   devtools: Vec<c_int>,
   zoom: Vec<c_int>,
+  close_window: Vec<c_int>,
 }
 
 fn blocked_commands() -> &'static BlockedCommands {
@@ -174,6 +185,7 @@ fn blocked_commands() -> &'static BlockedCommands {
       .collect(),
     devtools: command_ids(&[DEVTOOLS_COMMANDS]),
     zoom: command_ids(&[ZOOM_COMMANDS]),
+    close_window: command_ids(&[CLOSE_WINDOW_COMMANDS]),
   })
 }
 
@@ -199,6 +211,8 @@ wrap_with_args! {
     zoom_hotkeys_enabled: bool,
     allowed_chrome_commands: Vec<ChromeCommandGroup>,
     frame_navigation_state: crate::FrameNavigationState,
+    // Asks the app to close this webview's window, as its close button does.
+    request_window_close: std::sync::Arc<dyn Fn() + Send + Sync>,
   }
 
   impl CommandHandler {
@@ -208,6 +222,10 @@ wrap_with_args! {
       command_id: ::std::os::raw::c_int,
       _disposition: WindowOpenDisposition,
     ) -> ::std::os::raw::c_int {
+      // A CEF-owned popup is a real Chrome window, with a location bar and an app
+      // menu, so it only loses the commands listed above.
+      let is_popup = browser.as_ref().is_some_and(|browser| browser.is_popup() != 0);
+
       // Scoped the way the display handler and the frame observer are: CEF routes
       // browsers this webview does not own through this very client. A DevTools
       // window is the standing case — `ChromeBrowserDelegate` reuses the opener's
@@ -221,7 +239,24 @@ wrap_with_args! {
         return 0;
       }
 
-      if self.blocks(command_id) { 1 } else { 0 }
+      if is_popup {
+        return if self.blocks(command_id) { 1 } else { 0 };
+      }
+
+      // An app window has no menu or toolbar, so a command here always comes from a
+      // key the page saw and left alone. The page owns the keyboard: Chrome's own
+      // shortcuts do nothing unless the webview asked for them.
+      if blocked_commands().close_window.contains(&command_id) {
+        (self.request_window_close)();
+        return 1;
+      }
+      let runs = runs_in_app_window(
+        command_id,
+        &self.allowed_chrome_commands,
+        self.devtools_enabled,
+        self.zoom_hotkeys_enabled,
+      );
+      if runs { 0 } else { 1 }
     }
 
     // The four predicates below are pinned to what CEF would do on its own, with
@@ -298,13 +333,12 @@ impl TauriCefCommandHandler {
       .unwrap_or(false)
   }
 
-  /// Whether this webview swallows `command_id`.
+  /// Whether this webview's popups swallow `command_id`.
   ///
-  /// Anything not named in the tables above runs unchanged: clipboard, find in
-  /// page, text selection, undo and redo, fullscreen and reload are all things an
-  /// app window legitimately uses. A group the webview named in
-  /// `allowed_chrome_commands` is skipped entirely, so its commands run the way
-  /// they would in a browser.
+  /// A popup is a real Chrome window, so anything not named in the tables above
+  /// runs unchanged there: find in page, fullscreen and reload are things a browser
+  /// window uses. A group the webview named in `allowed_chrome_commands` is skipped
+  /// entirely, so its commands run the way they would in a browser.
   fn blocks(&self, command_id: c_int) -> bool {
     let commands = blocked_commands();
     commands
@@ -314,5 +348,76 @@ impl TauriCefCommandHandler {
       .any(|(_, ids)| ids.contains(&command_id))
       || (!self.devtools_enabled && commands.devtools.contains(&command_id))
       || (!self.zoom_hotkeys_enabled && commands.zoom.contains(&command_id))
+  }
+}
+
+/// Whether an app window runs Chrome's `command_id`.
+///
+/// Only what the webview asked for: the groups named in `allowed`, DevTools when it
+/// enabled devtools, and zoom when it enabled zoom hotkeys. Every other command is
+/// swallowed, including reload, find in page, caret browsing, fullscreen and the
+/// ones later Chromium releases add, so a key the page leaves alone does nothing.
+/// Clipboard, undo and text selection keys are edit commands the renderer runs on
+/// its own and never reach this.
+fn runs_in_app_window(
+  command_id: c_int,
+  allowed: &[ChromeCommandGroup],
+  devtools_enabled: bool,
+  zoom_hotkeys_enabled: bool,
+) -> bool {
+  let commands = blocked_commands();
+  commands
+    .groups
+    .iter()
+    .filter(|(group, _)| allowed.contains(group))
+    .any(|(_, ids)| ids.contains(&command_id))
+    || (devtools_enabled && commands.devtools.contains(&command_id))
+    || (zoom_hotkeys_enabled && commands.zoom.contains(&command_id))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  // This CEF build's numeric ids. Resolving names here instead would race:
+  // `cef_id_for_command_id_name` is not thread-safe on its first call, and the
+  // tests run in parallel.
+  use cef::sys::{
+    IDC_CARET_BROWSING_TOGGLE, IDC_CLOSE_TAB, IDC_DEV_TOOLS, IDC_FIND, IDC_FIND_NEXT,
+    IDC_FOCUS_NEXT_PANE, IDC_FULLSCREEN, IDC_PRINT, IDC_RELOAD, IDC_RELOAD_BYPASSING_CACHE,
+    IDC_ZOOM_PLUS,
+  };
+
+  #[test]
+  fn app_window_runs_none_of_chromes_own_commands() {
+    for command_id in [
+      IDC_RELOAD,
+      IDC_RELOAD_BYPASSING_CACHE,
+      IDC_FIND,
+      IDC_FIND_NEXT,
+      IDC_CARET_BROWSING_TOGGLE,
+      IDC_FULLSCREEN,
+      IDC_FOCUS_NEXT_PANE,
+      IDC_CLOSE_TAB,
+      IDC_PRINT,
+    ] {
+      assert!(
+        !runs_in_app_window(command_id, &[], true, true),
+        "command {command_id} should do nothing in an app window"
+      );
+    }
+  }
+
+  #[test]
+  fn app_window_runs_what_the_webview_asked_for() {
+    assert!(runs_in_app_window(
+      IDC_PRINT,
+      &[ChromeCommandGroup::Document],
+      false,
+      false
+    ));
+    assert!(runs_in_app_window(IDC_DEV_TOOLS, &[], true, false));
+    assert!(!runs_in_app_window(IDC_DEV_TOOLS, &[], false, false));
+    assert!(runs_in_app_window(IDC_ZOOM_PLUS, &[], false, true));
+    assert!(!runs_in_app_window(IDC_ZOOM_PLUS, &[], false, false));
   }
 }
