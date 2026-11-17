@@ -142,6 +142,24 @@ const ZOOM_COMMANDS: &[&CStr] = &[
   cef::resources::IDC_ZOOM_NORMAL,
 ];
 
+/// Closing the tab: Ctrl+W and Ctrl+F4.
+///
+/// Chrome would close the browser itself, outside the app's window lifecycle: the
+/// window's close handlers never run, and the window stays on screen with no page
+/// in it. An app window has no tab to close, so the command is dropped and the key
+/// means whatever the page binds it to, as in every other webview. `keyboard.rs`
+/// hands the page the key first.
+const CLOSE_TAB_COMMANDS: &[&CStr] = &[cef::resources::IDC_CLOSE_TAB];
+
+/// Closing the window: Ctrl+Shift+W and Alt+F4.
+///
+/// Chrome would close the browser behind the app the same way as
+/// [`CLOSE_TAB_COMMANDS`]. This one asks the app to close the window instead, as
+/// the window's close button does, so the app's close handlers run and can keep
+/// it open. Alt+F4 then still closes the window wherever the window manager
+/// passes it on.
+const CLOSE_WINDOW_COMMANDS: &[&CStr] = &[cef::resources::IDC_CLOSE_WINDOW];
+
 /// The IDC names of one [`ChromeCommandGroup`].
 fn group_commands(group: ChromeCommandGroup) -> &'static [&'static CStr] {
   match group {
@@ -163,6 +181,8 @@ struct BlockedCommands {
   groups: Vec<(ChromeCommandGroup, Vec<c_int>)>,
   devtools: Vec<c_int>,
   zoom: Vec<c_int>,
+  close_tab: Vec<c_int>,
+  close_window: Vec<c_int>,
 }
 
 fn blocked_commands() -> &'static BlockedCommands {
@@ -174,6 +194,8 @@ fn blocked_commands() -> &'static BlockedCommands {
       .collect(),
     devtools: command_ids(&[DEVTOOLS_COMMANDS]),
     zoom: command_ids(&[ZOOM_COMMANDS]),
+    close_tab: command_ids(&[CLOSE_TAB_COMMANDS]),
+    close_window: command_ids(&[CLOSE_WINDOW_COMMANDS]),
   })
 }
 
@@ -199,6 +221,8 @@ wrap_with_args! {
     zoom_hotkeys_enabled: bool,
     allowed_chrome_commands: Vec<ChromeCommandGroup>,
     frame_navigation_state: crate::FrameNavigationState,
+    // Asks the app to close this webview's window, as its close button does.
+    request_window_close: std::sync::Arc<dyn Fn() + Send + Sync>,
   }
 
   impl CommandHandler {
@@ -208,6 +232,9 @@ wrap_with_args! {
       command_id: ::std::os::raw::c_int,
       _disposition: WindowOpenDisposition,
     ) -> ::std::os::raw::c_int {
+      // A CEF-owned popup is a real Chrome window, so closing it stays Chrome's.
+      let is_popup = browser.as_ref().is_some_and(|browser| browser.is_popup() != 0);
+
       // Scoped the way the display handler and the frame observer are: CEF routes
       // browsers this webview does not own through this very client. A DevTools
       // window is the standing case — `ChromeBrowserDelegate` reuses the opener's
@@ -221,7 +248,14 @@ wrap_with_args! {
         return 0;
       }
 
-      if self.blocks(command_id) { 1 } else { 0 }
+      let commands = blocked_commands();
+      if !is_popup && commands.close_window.contains(&command_id) {
+        (self.request_window_close)();
+        return 1;
+      }
+      let closes_tab = !is_popup && commands.close_tab.contains(&command_id);
+
+      if closes_tab || self.blocks(command_id) { 1 } else { 0 }
     }
 
     // The four predicates below are pinned to what CEF would do on its own, with

@@ -252,11 +252,23 @@ wrap_with_args! {
     }
 
     fn command_handler(&self) -> Option<CommandHandler> {
+      let sender = self.sender.clone();
+      let proxy = self.proxy.clone();
+      let window_id = self.window_id;
       Some(TauriCefCommandHandler::build(TauriCefCommandHandlerArgs {
         devtools_enabled: self.devtools_enabled,
         zoom_hotkeys_enabled: self.zoom_hotkeys_enabled,
         allowed_chrome_commands: self.allowed_chrome_commands.clone(),
         frame_navigation_state: self.frame_navigation_state.clone(),
+        // Queued rather than run in place: Chrome is still dispatching the
+        // accelerator, and the close may destroy this very browser.
+        request_window_close: Arc::new(move || {
+          let _ = sender.send(Message::Window {
+            window_id,
+            message: crate::window::WindowMessage::Close,
+          });
+          proxy.wake_up();
+        }),
       }))
     }
 
