@@ -478,6 +478,21 @@ impl<R: Runtime> AppManager<R> {
   ///
   /// The message is not handled when the plugin exists **and** the command does not.
   pub fn run_plugin_invoke_handler(&self, plugin: &str, invoke: Invoke<R>) -> bool {
+    // Take the handler out of the store and run the command unlocked. On mobile a synchronous
+    // command (a path resolution, for instance) blocks its thread until the main thread answers a
+    // `run_mobile_plugin` call; holding the store meanwhile deadlocks the app as soon as the main
+    // thread needs the store itself, as it does for every navigation and page load.
+    let shared = self
+      .plugins
+      .lock()
+      .expect("poisoned plugin store")
+      .shared_invoke_handler(plugin);
+    if let Some(handler) = shared {
+      #[cfg(feature = "tracing")]
+      let _span = tracing::trace_span!("plugin::hooks::ipc", name = plugin).entered();
+      return handler(invoke);
+    }
+
     self
       .plugins
       .lock()
