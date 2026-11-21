@@ -110,6 +110,16 @@ pub trait Plugin<R: Runtime>: Send {
   fn extend_api(&mut self, invoke: Invoke<R>) -> bool {
     false
   }
+
+  /// The plugin's command handler, shared so it can run without the plugin store locked.
+  ///
+  /// The store is locked while [`Plugin::extend_api`] runs. A synchronous command that waits for the
+  /// main thread (a mobile plugin call such as a path resolution) then deadlocks against any
+  /// main-thread hook that needs the store, such as navigation. A plugin that returns its handler
+  /// here has its commands run unlocked; the default keeps the locked `extend_api` path.
+  fn shared_invoke_handler(&self) -> Option<Arc<InvokeHandler<R>>> {
+    None
+  }
 }
 
 type SetupHook<R, C> =
@@ -264,7 +274,7 @@ const RESERVED_PLUGIN_NAMES: &[&str] = &["core", "tauri"];
 /// ```
 pub struct Builder<R: Runtime, C: DeserializeOwned = ()> {
   name: &'static str,
-  invoke_handler: Box<InvokeHandler<R>>,
+  invoke_handler: Arc<InvokeHandler<R>>,
   setup: Option<Box<SetupHook<R, C>>>,
   js_init_script: Option<InitializationScript>,
   on_navigation: Box<OnNavigation<R>>,
@@ -283,7 +293,7 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
       name,
       setup: None,
       js_init_script: None,
-      invoke_handler: Box::new(|_| false),
+      invoke_handler: Arc::new(|_| false),
       on_navigation: Box::new(|_, _| true),
       on_page_load: Box::new(|_, _| ()),
       on_window_ready: Box::new(|_| ()),
@@ -322,7 +332,7 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
   where
     F: Fn(Invoke<R>) -> bool + Send + Sync + 'static,
   {
-    self.invoke_handler = Box::new(invoke_handler);
+    self.invoke_handler = Arc::new(invoke_handler);
     self
   }
 
@@ -760,7 +770,7 @@ impl<R: Runtime, C: DeserializeOwned> Builder<R, C> {
 pub struct TauriPlugin<R: Runtime, C: DeserializeOwned = ()> {
   name: &'static str,
   app: Option<AppHandle<R>>,
-  invoke_handler: Box<InvokeHandler<R>>,
+  invoke_handler: Arc<InvokeHandler<R>>,
   setup: Option<Box<SetupHook<R, C>>>,
   js_init_script: Option<InitializationScript>,
   on_navigation: Box<OnNavigation<R>>,
@@ -850,6 +860,10 @@ impl<R: Runtime, C: DeserializeOwned> Plugin<R> for TauriPlugin<R, C> {
 
   fn extend_api(&mut self, invoke: Invoke<R>) -> bool {
     (self.invoke_handler)(invoke)
+  }
+
+  fn shared_invoke_handler(&self) -> Option<Arc<InvokeHandler<R>>> {
+    Some(self.invoke_handler.clone())
   }
 }
 
@@ -978,6 +992,17 @@ impl<R: Runtime> PluginStore<R> {
       .store
       .iter_mut()
       .for_each(|plugin| plugin.on_event(app, event))
+  }
+
+  /// The command handler of the named plugin, when it can run without the store locked
+  /// (see [`Plugin::shared_invoke_handler`]). `None` when there is no such plugin or it keeps its
+  /// handler to itself, in which case [`Self::run_invoke_handler`] runs the command.
+  pub(crate) fn shared_invoke_handler(&self, plugin: &str) -> Option<Arc<InvokeHandler<R>>> {
+    self
+      .store
+      .iter()
+      .find(|p| p.name() == plugin)
+      .and_then(|p| p.shared_invoke_handler())
   }
 
   /// Runs the plugin [`Plugin::extend_api`] hook if it exists. Returns whether the invoke message was handled or not.
